@@ -1,0 +1,202 @@
+#include "mpu6050.h"
+#include "stm32f10x.h"
+
+#define I2C_SCL_GPIO   GPIOB
+#define I2C_SCL_PIN    GPIO_Pin_6
+#define I2C_SDA_GPIO   GPIOB
+#define I2C_SDA_PIN    GPIO_Pin_7
+
+#define MPU6050_ADDR 0xD0
+
+#define SCL_H()  GPIO_SetBits(I2C_SCL_GPIO, I2C_SCL_PIN)
+#define SCL_L()  GPIO_ResetBits(I2C_SCL_GPIO, I2C_SCL_PIN)
+#define SDA_H()  GPIO_SetBits(I2C_SDA_GPIO, I2C_SDA_PIN)
+#define SDA_L()  GPIO_ResetBits(I2C_SDA_GPIO, I2C_SDA_PIN)
+#define SDA_READ()  GPIO_ReadInputDataBit(I2C_SDA_GPIO, I2C_SDA_PIN)
+
+/* 简单软件延时（约微秒级，用于 I2C 时序） */
+static void i2c_delay(void)
+{
+    volatile uint32_t i;
+    for (i = 0; i < 60; i++);
+}
+
+/* ---------- I2C 底层时序 ---------- */
+static void I2C_Start(void)
+{
+    SDA_H();
+    SCL_H();
+    i2c_delay();
+    SDA_L();                 /* SDA 拉低，产生起始条件 */
+    i2c_delay();
+    SCL_L();
+}
+
+static void I2C_Stop(void)
+{
+    SCL_L();
+    SDA_L();
+    i2c_delay();
+    SCL_H();                 /* SCL 拉高期间 SDA 上升，产生停止条件 */
+    i2c_delay();
+    SDA_H();
+}
+
+static uint8_t I2C_WaitAck(void)
+{
+    uint8_t i;
+    SDA_H();                 /* 释放 SDA，等待从机应答 */
+    SCL_H();
+    i2c_delay();
+    if (SDA_READ()) {        /* SDA 为高 = 无应答 */
+        SCL_L();
+        return 1;
+    }
+    SCL_L();
+    return 0;
+}
+
+static void I2C_Ack(void)    /* 主机应答（发送 ACK） */
+{
+    SDA_L();
+    SCL_H();
+    i2c_delay();
+    SCL_L();
+}
+
+static void I2C_NAck(void)   /* 最后字节发 NACK 结束接收 */
+{
+    SDA_H();
+    SCL_H();
+    i2c_delay();
+    SCL_L();
+}
+
+static void I2C_SendByte(uint8_t dat)
+{
+    uint8_t i;
+    for (i = 0; i < 8; i++) {
+        if (dat & 0x80) SDA_H();
+        else            SDA_L();
+        SCL_H();
+        i2c_delay();
+        SCL_L();
+        dat <<= 1;
+    }
+}
+
+static uint8_t I2C_RecvByte(void)
+{
+    uint8_t i, dat = 0;
+    SDA_H();                 /* 释放 SDA，由从机驱动 */
+    for (i = 0; i < 8; i++) {
+        SCL_H();
+        i2c_delay();
+        dat = (dat << 1) | SDA_READ();
+        SCL_L();
+        i2c_delay();
+    }
+    return dat;
+}
+
+/* ---------- MPU6050 寄存器读写 ---------- */
+static void MPU6050_WriteReg(uint8_t reg, uint8_t dat)
+{
+    I2C_Start();
+    I2C_SendByte(MPU6050_ADDR);   /* 写地址 */
+    I2C_WaitAck();
+    I2C_SendByte(reg);
+    I2C_WaitAck();
+    I2C_SendByte(dat);
+    I2C_WaitAck();
+    I2C_Stop();
+}
+
+uint8_t mpu6050_ReadReg(uint8_t reg)
+{
+    uint8_t dat;
+    I2C_Start();
+    I2C_SendByte(MPU6050_ADDR);   /* 写地址 */
+    I2C_WaitAck();
+    I2C_SendByte(reg);
+    I2C_WaitAck();
+    I2C_Start();
+    I2C_SendByte(MPU6050_ADDR | 0x01); /* 读地址 */
+    I2C_WaitAck();
+    dat = I2C_RecvByte();
+    I2C_NAck();
+    I2C_Stop();
+    return dat;
+}
+
+/* 连续读多个字节（用于加速度/陀螺仪批量读取） */
+static void MPU6050_ReadBurst(uint8_t reg, uint8_t* buf, uint8_t len)
+{
+    uint8_t i;
+    I2C_Start();
+    I2C_SendByte(MPU6050_ADDR);
+    I2C_WaitAck();
+    I2C_SendByte(reg);
+    I2C_WaitAck();
+    I2C_Start();
+    I2C_SendByte(MPU6050_ADDR | 0x01);
+    I2C_WaitAck();
+    for (i = 0; i < len; i++) {
+        buf[i] = I2C_RecvByte();
+        if (i == len - 1) I2C_NAck();
+        else              I2C_Ack();
+    }
+    I2C_Stop();
+}
+
+/* ---------- 初始化 ---------- */
+uint8_t mpu6050_Init(void)
+{
+    GPIO_InitTypeDef gpio;
+		uint8_t who_am_i;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+
+    /* SCL、SDA 配置为开漏输出（软件 I2C） */
+    gpio.GPIO_Mode  = GPIO_Mode_Out_OD;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio.GPIO_Pin   = I2C_SCL_PIN | I2C_SDA_PIN;
+    GPIO_Init(I2C_SCL_GPIO, &gpio);
+
+    SCL_H();
+    SDA_H();
+	
+		who_am_i = mpu6050_ReadReg(0x75);
+		if(who_am_i != 0x68){
+			return 1;
+		}
+
+    /* 唤醒器件（清除睡眠位） */
+    MPU6050_WriteReg(0x6B, 0x01);
+    /* 采样率分频：SMPLRT_DIV=9 → 采样率 = 1kHz/(1+9) = 100Hz */
+    MPU6050_WriteReg(0x19, 0x09);
+    /* 配置：开启低通滤波，带宽约 44Hz，抑制高频抖动 */
+    MPU6050_WriteReg(0x1A, 0x03);
+    /* 陀螺仪量程 ±500°/s（对应灵敏度 65.5 LSB/(°/s)） */
+    MPU6050_WriteReg(0x1B, 0x08);
+    /* 加速度量程 ±4g（对应灵敏度 8192 LSB/g） */
+    MPU6050_WriteReg(0x1C, 0x08);
+		
+		return 0;
+}
+
+/* ---------- 读取原始数据 ---------- */
+void mpu6050_ReadRaw(int16_t* accx, int16_t* accy, int16_t* accz,
+                     int16_t* gyrx, int16_t* gyry, int16_t* gyrz)
+{
+    uint8_t buf[14];
+    /* 加速度从 0x3B 起 6 字节，陀螺仪从 0x43 起 6 字节 */
+    MPU6050_ReadBurst(0x3B, buf, 14);
+
+    *accx = (int16_t)((buf[0]  << 8) | buf[1]);
+    *accy = (int16_t)((buf[2]  << 8) | buf[3]);
+    *accz = (int16_t)((buf[4]  << 8) | buf[5]);
+    *gyrx = (int16_t)((buf[8]  << 8) | buf[9]);
+    *gyry = (int16_t)((buf[10] << 8) | buf[11]);
+    *gyrz = (int16_t)((buf[12] << 8) | buf[13]);
+}
